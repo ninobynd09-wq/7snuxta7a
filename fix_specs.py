@@ -37,31 +37,21 @@ LOG = logging.getLogger("fix_specs")
 
 # --- Regex helpers -----------------------------------------------------------
 
-# Speed: capture after "Speed:" up to a closing bracket/paren or separator.
-_RE_SPEED = re.compile(
-    r"(?is)\bSpeed\s*:\s*([^\)\]\|\n\r]+)"
-)
+_RE_SPEED = re.compile(r"(?is)\bSpeed\s*[:\-]?\s*([^\)\]\|\n\r]+)")
+_RE_START = re.compile(r"(?is)\bStart\s*[:\-]?\s*([^\)\]\|\n\r]+)")
 
-# Start: capture after "Start:" up to a closing bracket/paren or separator.
-_RE_START = re.compile(
-    r"(?is)\bStart\s*:\s*([^\)\]\|\n\r]+)"
-)
-
-# Refill: patterns (prefer explicit "Days Refill"/"Refill X Days")
-_RE_DAYS_REFILL_1 = re.compile(r"(?is)\b(\d{1,4})\s*(days?|d)\s*refill\b")
-_RE_DAYS_REFILL_2 = re.compile(r"(?is)\brefill\s*[:\-]?\s*(\d{1,4})\s*(days?|d)\b")
+# Refill patterns (much more robust)
+_RE_DAYS_REFILL = re.compile(r"(?is)\b(\d{1,4})\s*(?:days?|d)\s*(?:refill|guaranteed)", re.I)
+_RE_REFILL_DAYS = re.compile(r"(?is)refill\s*[:\-]?\s*(\d{1,4})\s*(?:days?|d)", re.I)
 
 _RE_NON_DROP = re.compile(r"(?is)\bnon[\s\-]*drop\b")
-_RE_NO_REFILL = re.compile(r"(?is)\bno\s*refill\b")
-_RE_REFILL_WORD = re.compile(r"(?is)\brefill\b")
+_RE_NO_REFILL = re.compile(r"(?is)\bno[\s\-]*refill\b")
 
 _RE_INSTANT = re.compile(r"(?is)\binstant\b")
 
 
 def _clean(val: str) -> str:
-    # Collapse whitespace and trim.
     v = re.sub(r"\s+", " ", val).strip()
-    # Trim trailing punctuation commonly found in names.
     v = v.strip(" -|,;")
     return v
 
@@ -69,7 +59,6 @@ def _clean(val: str) -> str:
 def parse_specs_from_name(name: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
     Returns (speed, refill, start_time) parsed from a service name string.
-    Values are cleaned but otherwise kept close to original text.
     """
     if not name:
         return None, None, None
@@ -78,41 +67,30 @@ def parse_specs_from_name(name: str) -> Tuple[Optional[str], Optional[str], Opti
     refill: Optional[str] = None
     start_time: Optional[str] = None
 
+    # Speed
     m = _RE_SPEED.search(name)
     if m:
         speed = _clean(m.group(1))
 
-    # Refill detection (ordered by specificity)
-    m = _RE_DAYS_REFILL_1.search(name)
+    # Refill - ordered by specificity (no generic "Refill" anymore)
+    m = _RE_DAYS_REFILL.search(name)
     if m:
-        n = m.group(1)
-        unit = m.group(2).lower()
-        unit_norm = "Days" if unit.startswith("d") else "Days"
-        refill = f"{n} {unit_norm} Refill"
+        refill = f"{m.group(1)} Days Refill"
     else:
-        m = _RE_DAYS_REFILL_2.search(name)
+        m = _RE_REFILL_DAYS.search(name)
         if m:
-            n = m.group(1)
-            unit = m.group(2).lower()
-            unit_norm = "Days" if unit.startswith("d") else "Days"
-            refill = f"{n} {unit_norm} Refill"
-        else:
-            if _RE_NON_DROP.search(name):
-                refill = "Non Drop"
-            elif _RE_NO_REFILL.search(name):
-                refill = "No Refill"
-            else:
-                # Some catalogs use "Refill" without a duration; keep as generic indicator
-                if _RE_REFILL_WORD.search(name):
-                    refill = "Refill"
+            refill = f"{m.group(1)} Days Refill"
+        elif _RE_NON_DROP.search(name):
+            refill = "Non Drop"
+        elif _RE_NO_REFILL.search(name):
+            refill = "No Refill"
 
+    # Start time
     m = _RE_START.search(name)
     if m:
         start_time = _clean(m.group(1))
-    else:
-        # Common fallback: "Instant" / "Instant Start"
-        if _RE_INSTANT.search(name):
-            start_time = "Instant"
+    elif _RE_INSTANT.search(name):
+        start_time = "Instant"
 
     return speed, refill, start_time
 
@@ -124,7 +102,6 @@ def _is_empty(v: Optional[str]) -> bool:
 async def run() -> None:
     load_dotenv()
 
-    # Resolve DB URL
     db_url = os.getenv("DATABASE_URL")
     if load_settings is not None:
         try:
@@ -146,9 +123,7 @@ async def run() -> None:
     scanned = 0
 
     async with Session() as session:
-        # Only scan rows where speed is NULL/empty per requirement (and we still won't overwrite other fields).
         stmt = select(Service).where(or_(Service.speed.is_(None), Service.speed == ""))
-        # Stream to avoid loading the full table into memory
         stream = await session.stream_scalars(stmt)
 
         pending = 0
@@ -162,8 +137,6 @@ async def run() -> None:
                 svc.speed = speed_p
                 changed = True
             if _is_empty(svc.refill) and refill_p:
-                # Avoid writing generic "Refill" if we learned nothing specific and field already empty? It's still a backfill;
-                # keep it, but only if nothing else exists.
                 svc.refill = refill_p
                 changed = True
             if _is_empty(svc.start_time) and start_p:
@@ -174,7 +147,6 @@ async def run() -> None:
                 updated += 1
                 pending += 1
 
-            # Commit in batches to keep transactions reasonable
             if pending >= 500:
                 await session.commit()
                 pending = 0
